@@ -1,7 +1,7 @@
 # Nagios
 https://www.nagios.org/
 
-A few scripts I've had to make to make my life easier:
+A few scripts I've had to make for the outstanding Nagios to make my life easier:
 
 ```canon_printers.pl```
 
