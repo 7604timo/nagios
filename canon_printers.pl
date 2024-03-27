@@ -2,12 +2,11 @@
 #
 #
 # There's probably much neater solutions to this, but this script serves me very well in integrating Canon priner stats into Nagios and keeping users happy
-# It uses SNMP to get everything it can about a Canon IrADV printer and over the network and print it all out, with the '-n' option to make the output Nagios-friendly
+# It uses SNMP to get everything it can about a Canon IrADV printer and over the network and print it all out, with the '-N' option to make the output Nagios-friendly
 # You can optionally have a DB connection to store printer page counts, but it's not necessary as all printer data is collected through SNMP - you just need the IP address
 # Obviously SNMP has to be enabled on the printer!
 #
 #
-
 #use strict;
 #use warnings;
 use Switch;
@@ -19,8 +18,6 @@ use Getopt::Std;
 
 # Counters required for managed print providers to get page counts
 @interesting_counters = (106,109,113,123);
-
-#$debug=1;
 
 my %options=();
 getopts("t:H:Nz", \%options);
@@ -34,7 +31,7 @@ Nagios script to check stats of a Canon IrADV device
 
 Usage:
 -t      Type of check: [ cyan|magenta|yellow|black | paper | toner | consumables | features | errors | counters | all ]
--H	[optional] IP address of device to check. Default is to check all printers from DB
+-H	[optional] IP address of device to check. Default is to check all printers in DB
 -N	[optional] Nagios output mode
 
 Example:
@@ -50,6 +47,7 @@ if(!defined $options{t}){
         exit $UNKNOWN;
 }
 
+
 # Nagios return codes
 $OK = 0;
 $WARNING = 1;
@@ -62,13 +60,15 @@ $STATUS = 0;
 #  Structure is simply these columns:
 #  id(int), model(varchar), ip(varchar), mac(varchar), location(varchar), serial(varchar), enabled(int)
 my $sth;
-$dbh = DBI->connect('DBI:mysql:canonPrinters', 'myUser', 'myPassword'
+$dbh = DBI->connect('DBI:mysql:canon_printers', 'dbUser', 'myPassword'
                                    ) || die "Could not connect to database: $DBI::errstr";
 
 # Prepare to insert page count data:
 $str = $dbh->prepare("insert into page_counts (mono, colour, host_id) values (?,?,?)");
 
-# Canon SNMP OIDs
+
+# Figuring out these took a while!
+# This is all the Canon SNMP OID tables that tell us about the machines
 my $toner_colour_table = ".1.3.6.1.2.1.43.12.1.1.4.1";
 my $toner_type_table = ".1.3.6.1.2.1.43.11.1.1.6.1";
 my $toner_max_table = ".1.3.6.1.2.1.43.11.1.1.8.1";
@@ -94,21 +94,26 @@ my $drawer_type_table = ".1.3.6.1.2.1.43.8.2.1.13.1";
 my $drawer_max_table = ".1.3.6.1.2.1.43.8.2.1.9.1";
 my $drawer_current_table = ".1.3.6.1.2.1.43.8.2.1.10.1";
 
-# Were we given an IP address to check?
+# Were we passed an IP, or are we taking the list of IPs from a db?
+my @targets;
 if($options{H}) {
-	$sth = $dbh->prepare("select * from printers where ip='".$options{H}."'");
+        push(@targets, $options{H});	# IP address on the command line..
 	} else {
 		# Get list of printers
-		$sth = $dbh->prepare("select * from printers where enabled=1");
+		$sth = $dbh->prepare("select ip from printers where enabled=1");
+		$sth->execute();
+		while(my @row = $sth->fetchrow_array) {
+		 push(@targets, $row[0]);
+		}
 	}
 
-$sth->execute();
-LOOP: while (@printer = $sth->fetchrow_array()) {
+foreach $i (@targets) {
 	$hostisup = 1;
+	$ip = $i;
   	($session, $error) = Net::SNMP->session(
-      		-hostname  => $printer[2],
+      		-hostname  => $ip,
       		-community => 'public',
-		      -timeout => '5'
+		-timeout => '5'
    	);
    if (!defined $session) {
       printf "SNMP Error: %s.\n", $error;
@@ -116,7 +121,6 @@ LOOP: while (@printer = $sth->fetchrow_array()) {
    }
 
 	$sysinfo = $session->get_request(-varbindlist => [$location, $serial, $uptime, $sysname, $firmware]);
-
 	switch($options{t}) {
 		case("firmware") {
 			&firmware();
@@ -161,6 +165,9 @@ LOOP: while (@printer = $sth->fetchrow_array()) {
 		&finisher();
 	}
 
+
+	if($rerror_table) {
+	}
 	print($msg);
 	# Are we running in Nagios mode?
 	if($options{N}) {
@@ -183,10 +190,9 @@ sub consumables() {
 	my $rfinisher_max_table = $session->get_table(-baseoid => $finisher_max_table);
 	my $rfinisher_current_table = $session->get_table(-baseoid => $finisher_current_table);
 	my $toner_string;
-
-  # Query the finisher unit to see how many staples are left:
-  foreach my $key (keys %$rfinisher_type_table) {
-    my ($counter_id) = $key =~ m/\.([0-9]+)$/;
+  	# Query the finisher unit to see how many staples are left:
+	foreach my $key (keys %$rfinisher_type_table) {
+               	my ($counter_id) = $key =~ m/\.([0-9]+)$/;
 		my $type = $rfinisher_type_table->{$finisher_type_table.".".$counter_id};
 		my $max = $rfinisher_max_table->{$finisher_max_table.".".$counter_id};
 		my $current = $rfinisher_current_table->{$finisher_current_table.".".$counter_id};
@@ -195,30 +201,31 @@ sub consumables() {
 			$toner_string .= "   $type: $percent%\n";
 		}
 	}
- 
-  # Query the printer to see how much toner is left.
-  foreach my $key (keys %$rtoner_colour_table) {
-    my ($counter_id) = $key =~ m/\.([0-9]+)$/;
+  	# Query the printer to see how much toner is left.
+	foreach my $key (keys %$rtoner_colour_table) {
+                my ($counter_id) = $key =~ m/\.([0-9]+)$/;
 		my $colour = $rtoner_colour_table->{$toner_colour_table.".".$counter_id};
 		my $type = $rtoner_type_table->{$toner_type_table.".".$counter_id};
 		my $max = $rtoner_max_table->{$toner_max_table.".".$counter_id};
 		my $current = $rtoner_current_table->{$toner_current_table.".".$counter_id};
 		my $percent = ($current/$max)*100;
 		if(($percent <= 20) || ($arg eq "all")) {
+#			$toner_string .= "$colour ($type): $percent% in ".$sysinfo->{$serial}."(".$sysinfo->{$location}.")\n";
 			$toner_string .= "   $type: $percent%\n";
 		}
 	}
 
-  # Check the waste toner, but also check the printer error message to see if there's a warning about
-  #  about it because the SNMP data only tells you when the waste is full, not when it's almost full
+  	# Check the waste toner, but also check the printer error message to see if there's a warning about
+  	#  about it because the SNMP data only tells you when the waste is full, not when it's almost full
 	my ($wstatus, $wmsg) = check_waste_error();
 	if(($wstatus ne $OK) || ($arg eq "all")) {
 		$toner_string .= "   ".$wmsg;
 	}
 
-  # If any consumables need replacing, print it out:
+  	# If any consumables need replacing, print it out:
 	if($toner_string) {
-		print("Consumables for ".$printer[2]." ");
+#		print("* Printer in ".$sysinfo->{$location}." ".$sysinfo->{$serial}." (".$sysinfo->{$sysname}.")\n");
+		print("Consumables for ".$ip." ");
 		print(GREEN,$sysinfo->{$serial},RESET);
 		print(" in ".$sysinfo->{$location}.":\n");
 		print("$toner_string");
@@ -248,7 +255,7 @@ sub paper() {
 
 	print("Paper Drawers\n");
 	foreach my $key (sort(keys %$rdrawer_type_table)) {
-    my ($counter_id) = $key =~ m/\.([0-9]+)$/;
+                my ($counter_id) = $key =~ m/\.([0-9]+)$/;
 		my $type = $rdrawer_type_table->{$drawer_type_table.".".$counter_id};
 		my $max = $rdrawer_max_table->{$drawer_max_table.".".$counter_id};
 		my $current = $rdrawer_current_table->{$drawer_current_table.".".$counter_id};
@@ -258,7 +265,7 @@ sub paper() {
 
 	print("Paper Trays\n");
 	foreach my $key (sort(keys %$rtray_type_table)) {
-    my ($counter_id) = $key =~ m/\.([0-9]+)$/;
+                my ($counter_id) = $key =~ m/\.([0-9]+)$/;
 		my $type = $rtray_type_table->{$tray_type_table.".".$counter_id};
 		my $max = $rtray_max_table->{$tray_max_table.".".$counter_id};
 		my $current = $rtray_current_table->{$tray_current_table.".".$counter_id};
@@ -266,13 +273,12 @@ sub paper() {
 		print("* $type: $percent%\n");
 	}
 }
-
 # Get page counts
 sub counters() {
 	my $rcounters_table = $session->get_table(-baseoid => $counters_table);
 	print("Counters for "."(".$sysinfo->{$location}.") ");
 	print(GREEN,$sysinfo->{$serial},RESET);
-	print(" [".$printer[2]."]:\n");
+	print(" [".$ip."]:\n");
 	foreach my $key (keys %$rcounters_table) {
 		my ($counter_id) = $key =~ m/\.([0-9]+)$/;
 		if($counter_id ~~ @interesting_counters) {
@@ -286,6 +292,7 @@ sub errors() {
 	my $rerror_table = $session->get_table(-baseoid => $error_table);
 	my $serror;
 	foreach my $key (keys %$rerror_table) {
+#		my ($counter_id) = $key =~ m/\.([0-9]+)$/;
 		if($options{N}) {
 			if($rerror_table->{$key} =~ m/(toner|paper)/i) {
 				$str = "WARNING: ";
@@ -307,7 +314,7 @@ sub errors() {
 sub features() {
 	my $rfeatures_table = $session->get_table(-baseoid => $features_table);
 	print(GREEN,$sysinfo->{$sysname},RESET);
-	print(" [".$printer[2]."] ".$sysinfo->{$location}." (".$sysinfo->{$serial}.")\n");
+	print(" [".$ip."] ".$sysinfo->{$location}." (".$sysinfo->{$serial}.")\n");
 	foreach my $key (keys %$rfeatures_table) {
 		print("* ".$rfeatures_table->{$key}."\n");
 	}
@@ -344,7 +351,7 @@ sub a_toner() {
 	my $rtoner_current_table = $session->get_table(-baseoid => $toner_current_table);
 	my $rtoner_type_table = $session->get_table(-baseoid => $toner_type_table);
 	foreach my $key (keys %$rtoner_colour_table) {
-    my ($counter_id) = $key =~ m/\.([0-9]+)$/;
+                my ($counter_id) = $key =~ m/\.([0-9]+)$/;
 		my $colour = $rtoner_colour_table->{$toner_colour_table.".".$counter_id};
 		my $type = $rtoner_type_table->{$toner_type_table.".".$counter_id};
 		my $max = $rtoner_max_table->{$toner_max_table.".".$counter_id};
@@ -362,6 +369,7 @@ sub a_toner() {
 						# 'The Black toner is out.'
 						# 'toner is out (black).'
 						my $rerror_table = $session->get_table(-baseoid => $error_table);
+#						print Dumper $rerror_table;
 						foreach my $key (keys %$rerror_table) {
 							if($rerror_table->{$key} =~ m/The $colour toner is out./i) {
 								print("CRITICAL: ".ucfirst("$colour available $percent%, but error flagged\n"));
@@ -397,6 +405,10 @@ sub finisher() {
 	my $rfinisher_type_table = $session->get_table(-baseoid => $finisher_type_table);
 	my $rfinisher_max_table = $session->get_table(-baseoid => $finisher_max_table);
 	my $rfinisher_current_table = $session->get_table(-baseoid => $finisher_current_table);
+#	print("Consumables for ");
+#	print(GREEN,$sysinfo->{$serial},RESET);
+#	print(" in ".$sysinfo->{$location}.":\n");
+#	print("Finisher:\n");
 	foreach my $key (keys %$rfinisher_type_table) {
                	my ($counter_id) = $key =~ m/\.([0-9]+)$/;
 		my $type = $rfinisher_type_table->{$finisher_type_table.".".$counter_id};
@@ -404,6 +416,7 @@ sub finisher() {
 		my $current = $rfinisher_current_table->{$finisher_current_table.".".$counter_id};
 		my $percent = ($current/$max)*100;
 		$search_type = lc($type);
+#		print("Method: $method, Needle: $search_type\n");
 		if($method eq "saddle") { $method = "saddle staples"; }
 		if($method eq $search_type) {
 			if($options{N}) {
@@ -413,8 +426,10 @@ sub finisher() {
 				if($percent == 0) { $STATUS = $CRITICAL; $msg = "CRITICAL: ";}
 				$msg .= "$type: $percent%\n";
 			} else {
+#				$msg = "* $type: $percent%\n";
 				$msg = "Type: $type, MAX: $max, CURRENT: $current\n";
 			}
+#			print("Type: $type, MAX: $max, CURRENT: $current\n");
 		}
 	}
 	return($STATUS,$msg);
@@ -444,6 +459,7 @@ sub check_waste_error() {
 	my $rerror_table = $session->get_table(-baseoid => $error_table);
 	my $serror, $wmsg, $status = $OK, $pmsg = "OK: ", $status2, $msg2;
 	foreach my $key (keys %$rerror_table) {
+#		my ($counter_id) = $key =~ m/\.([0-9]+)$/;
 		if($rerror_table->{$key} =~ m/waste/) {
 			$serror .= "   ".$rerror_table->{$key}."\n";
 			if($serror =~ m/The waste toner container is full soon./) {
@@ -471,6 +487,6 @@ sub check_waste_error() {
 	if(!defined($wmsg)) { $wmsg = "Waste Toner OK\n"; }
 	if(defined($options{N})) { 
 		$wmsg = $pmsg.$wmsg;
-	} 
+	}
 	return($status,$wmsg);
 }
